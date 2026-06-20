@@ -21,6 +21,35 @@ _get_config = None
 # Shared session for HTTP connection pooling (keeps TCP/TLS connections alive)
 http_session = requests.Session()
 
+def send_callback_event(callback_url: str, project_id: str, dataset_id: str, task_id: str, event_type: str, message: str, severity: str = "info", count: int = 1):
+    if not (callback_url and project_id and dataset_id):
+        return
+    try:
+        payload = {
+            "projectId": project_id,
+            "datasetId": dataset_id,
+            "events": [
+                {
+                    "type": event_type,
+                    "message": message,
+                    "severity": severity,
+                    "metadata": {
+                        "taskId": task_id,
+                        "count": count
+                    }
+                }
+            ]
+        }
+        resp = http_session.post(
+            callback_url,
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=10
+        )
+        resp.raise_for_status()
+    except Exception as cb_err:
+        logger.error(f"Failed to send progress callback to backend: {cb_err}")
+
 async def enqueue_task(image_url: str, upload_url: str, project_id: str = None, dataset_id: str = None, task_id: str = None, callback_url: str = None):
     await download_queue.put({
         "image_url": image_url,
@@ -70,6 +99,21 @@ async def downloader_loop():
             if _metrics:
                 _metrics["error_count"] += 1
             logger.error(f"Downloader task error for {task.get('image_url')}: {e}")
+            callback_url = task.get("callback_url")
+            project_id = task.get("project_id")
+            dataset_id = task.get("dataset_id")
+            task_id = task.get("task_id")
+            if callback_url and project_id and dataset_id and task_id:
+                await asyncio.to_thread(
+                    send_callback_event,
+                    callback_url,
+                    project_id,
+                    dataset_id,
+                    task_id,
+                    "error",
+                    f"Downloader error for {task.get('image_url')}: {str(e)}",
+                    "warning"
+                )
         finally:
             download_queue.task_done()
             if 'image_bytes' in locals():
@@ -153,6 +197,21 @@ async def gpu_loop():
             if _metrics:
                 _metrics["error_count"] += 1
             logger.error(f"GPU inference pipeline task error: {e}")
+            callback_url = task.get("callback_url")
+            project_id = task.get("project_id")
+            dataset_id = task.get("dataset_id")
+            task_id = task.get("task_id")
+            if callback_url and project_id and dataset_id and task_id:
+                await asyncio.to_thread(
+                    send_callback_event,
+                    callback_url,
+                    project_id,
+                    dataset_id,
+                    task_id,
+                    "error",
+                    f"GPU inference error: {str(e)}",
+                    "warning"
+                )
         finally:
             gpu_queue.task_done()
 
@@ -178,44 +237,42 @@ async def uploader_loop():
                 _metrics["total_embeddings_generated"] += 1
             logger.info(f"Background pipeline successfully processed and uploaded embedding for {image_url}")
             
+            
             # Dispatch progress callback to Node.js backend if provided
             callback_url = task.get("callback_url")
             project_id = task.get("project_id")
             dataset_id = task.get("dataset_id")
             task_id = task.get("task_id")
             
-            if callback_url and project_id and dataset_id:
-                def send_callback():
-                    try:
-                        payload = {
-                            "projectId": project_id,
-                            "datasetId": dataset_id,
-                            "events": [
-                                {
-                                    "type": "progress",
-                                    "message": f"Successfully generated and uploaded SAM 2 embedding for task {task_id}",
-                                    "severity": "info",
-                                    "metadata": {
-                                        "taskId": task_id,
-                                        "count": 1
-                                    }
-                                }
-                            ]
-                        }
-                        resp = http_session.post(
-                            callback_url,
-                            json=payload,
-                            headers={"Content-Type": "application/json"},
-                            timeout=10
-                        )
-                        resp.raise_for_status()
-                    except Exception as cb_err:
-                        logger.error(f"Failed to send progress callback to backend: {cb_err}")
-                await asyncio.to_thread(send_callback)
+            if callback_url and project_id and dataset_id and task_id:
+                await asyncio.to_thread(
+                    send_callback_event,
+                    callback_url,
+                    project_id,
+                    dataset_id,
+                    task_id,
+                    "progress",
+                    f"Successfully generated and uploaded SAM 2 embedding for task {task_id}"
+                )
         except Exception as e:
             if _metrics:
                 _metrics["error_count"] += 1
             logger.error(f"Uploader task error for {task.get('image_url')}: {e}")
+            callback_url = task.get("callback_url")
+            project_id = task.get("project_id")
+            dataset_id = task.get("dataset_id")
+            task_id = task.get("task_id")
+            if callback_url and project_id and dataset_id and task_id:
+                await asyncio.to_thread(
+                    send_callback_event,
+                    callback_url,
+                    project_id,
+                    dataset_id,
+                    task_id,
+                    "error",
+                    f"Uploader error: {str(e)}",
+                    "warning"
+                )
         finally:
             uploader_queue.task_done()
             if 'embedding_bytes' in locals():

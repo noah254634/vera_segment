@@ -10,6 +10,7 @@ from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, HttpUrl
 from typing import List, Dict, Any, Optional
+from pipeline import start_pipeline, enqueue_task
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -97,6 +98,17 @@ def load_sam2_model():
 @app.on_event("startup")
 def startup_event():
     load_sam2_model()
+    
+    def get_predictor():
+        return predictor
+        
+    def get_config():
+        return {
+            "mock_mode": FASTAPI_ML_MOCK,
+            "device": DEVICE
+        }
+        
+    start_pipeline(metrics, get_predictor, get_config)
 
 # Schemas
 class SettingsUpdate(BaseModel):
@@ -107,84 +119,16 @@ class GenerateEmbeddingRequest(BaseModel):
     image_url: HttpUrl
     upload_url: HttpUrl
 
-@app.post("/api/v1/generate-embedding", status_code=status.HTTP_200_OK)
+@app.post("/api/v1/generate-embedding", status_code=status.HTTP_202_ACCEPTED)
 async def generate_embedding(req: GenerateEmbeddingRequest):
-    logger.info(f"Generating embedding for image URL: {req.image_url}")
-    start_time = time.time()
-
+    logger.info(f"Queuing embedding request for image URL: {req.image_url}")
     try:
-        # Download image bytes
-        response = requests.get(str(req.image_url), timeout=120)
-        response.raise_for_status()
-        image_bytes = response.content
-
-        # Decode image using OpenCV
-        nparr = np.frombuffer(image_bytes, np.uint8)
-        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR) # HWC BGR
-        if img is None:
-            raise HTTPException(status_code=400, detail="Invalid image file or format.")
-        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-
-        # Handle Mock or Real inference
-        if predictor is None or FASTAPI_ML_MOCK:
-            logger.info("Running in mock mode - generating dummy embedding array.")
-            emb_buffer = io.BytesIO()
-            np.savez_compressed(
-                emb_buffer,
-                image_embed=np.zeros((1, 256, 64, 64), dtype=np.float32),
-                high_res_feat_0=np.zeros((1, 32, 256, 256), dtype=np.float32),
-                high_res_feat_1=np.zeros((1, 64, 128, 128), dtype=np.float32),
-                orig_h=float(img.shape[0]),
-                orig_w=float(img.shape[1])
-            )
-            embedding_bytes = emb_buffer.getvalue()
-        else:
-            import torch
-            
-            autocast_device = "cuda" if "cuda" in DEVICE else "cpu"
-            autocast_dtype = torch.bfloat16 if autocast_device == "cuda" and torch.cuda.is_bf16_supported() else torch.float16
-            
-            with torch.inference_mode(), torch.autocast(autocast_device, dtype=autocast_dtype):
-                predictor.set_image(img_rgb)
-                features = predictor._features
-                orig_h, orig_w = img.shape[:2]
-                
-                emb_buffer = io.BytesIO()
-                np.savez_compressed(
-                    emb_buffer,
-              image_embed=features["image_embed"].float().cpu().numpy(),
-                    high_res_feat_0=features["high_res_feats"][0].float().cpu().numpy(),
-                    high_res_feat_1=features["high_res_feats"][1].float().cpu().numpy(),
-                    orig_h=float(orig_h),
-                    orig_w=float(orig_w)
-                )
-                embedding_bytes = emb_buffer.getvalue()
-
-        # Upload embedding to Cloudflare R2
-        upload_resp = requests.put(
-            str(req.upload_url),
-            data=embedding_bytes,
-            headers={"Content-Type": "application/octet-stream"},
-            timeout=120
-        )
-        upload_resp.raise_for_status()
-
-        elapsed = time.time() - start_time
-        metrics["total_embeddings_generated"] += 1
-        metrics["total_embedding_time_sec"] += elapsed
-        logger.info(f"Successfully generated and uploaded embedding in {elapsed:.2f} seconds.")
-        return {"status": "success", "message": "Embedding generated and uploaded.", "elapsed_seconds": elapsed}
-
+        await enqueue_task(str(req.image_url), str(req.upload_url))
+        return {"status": "success", "message": "Embedding request queued successfully."}
     except Exception as e:
-        import traceback
-        try:
-            with open(r"c:\Users\Administrator\veralabel_cv_model\sam2\error.log", "a") as f:
-                f.write(f"Error for {req.image_url}:\n{traceback.format_exc()}\n\n")
-        except Exception:
-            pass
         metrics["error_count"] += 1
-        logger.error(f"Error during embedding generation: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to generate embedding: {str(e)}")
+        logger.error(f"Failed to queue embedding request: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to queue embedding request: {str(e)}")
 
 @app.get("/api/v1/telemetry")
 def get_telemetry():

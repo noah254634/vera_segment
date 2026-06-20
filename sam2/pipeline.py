@@ -1,6 +1,7 @@
 import asyncio
 import io
 import logging
+import time
 import cv2
 import numpy as np
 import requests
@@ -17,6 +18,9 @@ _metrics = None
 _get_predictor = None
 _get_config = None
 
+# Shared session for HTTP connection pooling (keeps TCP/TLS connections alive)
+http_session = requests.Session()
+
 async def enqueue_task(image_url: str, upload_url: str):
     await download_queue.put({
         "image_url": image_url,
@@ -30,7 +34,7 @@ async def downloader_loop():
             image_url = task["image_url"]
             upload_url = task["upload_url"]
             
-            response = await asyncio.to_thread(requests.get, image_url, timeout=120)
+            response = await asyncio.to_thread(http_session.get, image_url, timeout=120)
             response.raise_for_status()
             image_bytes = response.content
             
@@ -76,6 +80,7 @@ async def gpu_loop():
             mock_mode = config.get("mock_mode", False)
             device = config.get("device", "cpu")
             
+            start_time = time.time()
             if predictor is None or mock_mode:
                 def gen_mock():
                     emb_buffer = io.BytesIO()
@@ -113,6 +118,10 @@ async def gpu_loop():
                         
                 embedding_bytes = await asyncio.to_thread(run_inference)
                 
+            duration = time.time() - start_time
+            if _metrics:
+                _metrics["total_embedding_time_sec"] += duration
+                
             await uploader_queue.put({
                 "embedding_bytes": embedding_bytes,
                 "upload_url": upload_url,
@@ -134,7 +143,7 @@ async def uploader_loop():
             image_url = task["image_url"]
             
             def upload():
-                resp = requests.put(
+                resp = http_session.put(
                     upload_url,
                     data=embedding_bytes,
                     headers={"Content-Type": "application/octet-stream"},

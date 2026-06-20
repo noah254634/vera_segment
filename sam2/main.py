@@ -118,12 +118,23 @@ class SettingsUpdate(BaseModel):
 class GenerateEmbeddingRequest(BaseModel):
     image_url: HttpUrl
     upload_url: HttpUrl
+    project_id: Optional[str] = None
+    dataset_id: Optional[str] = None
+    task_id: Optional[str] = None
+    callback_url: Optional[str] = None
 
 @app.post("/api/v1/generate-embedding", status_code=status.HTTP_202_ACCEPTED)
 async def generate_embedding(req: GenerateEmbeddingRequest):
-    logger.info(f"Queuing embedding request for image URL: {req.image_url}")
+    logger.info(f"Queuing embedding request for task ID: {req.task_id}")
     try:
-        await enqueue_task(str(req.image_url), str(req.upload_url))
+        await enqueue_task(
+            str(req.image_url),
+            str(req.upload_url),
+            req.project_id,
+            req.dataset_id,
+            req.task_id,
+            req.callback_url
+        )
         return {"status": "success", "message": "Embedding request queued successfully."}
     except Exception as e:
         metrics["error_count"] += 1

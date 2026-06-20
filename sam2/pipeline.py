@@ -21,10 +21,14 @@ _get_config = None
 # Shared session for HTTP connection pooling (keeps TCP/TLS connections alive)
 http_session = requests.Session()
 
-async def enqueue_task(image_url: str, upload_url: str):
+async def enqueue_task(image_url: str, upload_url: str, project_id: str = None, dataset_id: str = None, task_id: str = None, callback_url: str = None):
     await download_queue.put({
         "image_url": image_url,
-        "upload_url": upload_url
+        "upload_url": upload_url,
+        "project_id": project_id,
+        "dataset_id": dataset_id,
+        "task_id": task_id,
+        "callback_url": callback_url
     })
 
 async def downloader_loop():
@@ -56,7 +60,11 @@ async def downloader_loop():
                 "upload_url": upload_url,
                 "orig_h": h,
                 "orig_w": w,
-                "image_url": image_url
+                "image_url": image_url,
+                "project_id": task.get("project_id"),
+                "dataset_id": task.get("dataset_id"),
+                "task_id": task.get("task_id"),
+                "callback_url": task.get("callback_url")
             })
         except Exception as e:
             if _metrics:
@@ -64,6 +72,12 @@ async def downloader_loop():
             logger.error(f"Downloader task error for {task.get('image_url')}: {e}")
         finally:
             download_queue.task_done()
+            if 'image_bytes' in locals():
+                del image_bytes
+            if 'img_rgb' in locals():
+                del img_rgb
+            import gc
+            gc.collect()
 
 async def gpu_loop():
     while True:
@@ -114,9 +128,13 @@ async def gpu_loop():
                             orig_h=float(orig_h),
                             orig_w=float(orig_w)
                         )
+                        # Reset predictor state immediately after extracting tensors to free GPU memory
+                        predictor.reset_predictor()
                         return emb_buffer.getvalue()
                         
                 embedding_bytes = await asyncio.to_thread(run_inference)
+                if "cuda" in device:
+                    torch.cuda.empty_cache()
                 
             duration = time.time() - start_time
             if _metrics:
@@ -125,7 +143,11 @@ async def gpu_loop():
             await uploader_queue.put({
                 "embedding_bytes": embedding_bytes,
                 "upload_url": upload_url,
-                "image_url": image_url
+                "image_url": image_url,
+                "project_id": task.get("project_id"),
+                "dataset_id": task.get("dataset_id"),
+                "task_id": task.get("task_id"),
+                "callback_url": task.get("callback_url")
             })
         except Exception as e:
             if _metrics:
@@ -155,12 +177,51 @@ async def uploader_loop():
             if _metrics:
                 _metrics["total_embeddings_generated"] += 1
             logger.info(f"Background pipeline successfully processed and uploaded embedding for {image_url}")
+            
+            # Dispatch progress callback to Node.js backend if provided
+            callback_url = task.get("callback_url")
+            project_id = task.get("project_id")
+            dataset_id = task.get("dataset_id")
+            task_id = task.get("task_id")
+            
+            if callback_url and project_id and dataset_id:
+                def send_callback():
+                    try:
+                        payload = {
+                            "projectId": project_id,
+                            "datasetId": dataset_id,
+                            "events": [
+                                {
+                                    "type": "progress",
+                                    "message": f"Successfully generated and uploaded SAM 2 embedding for task {task_id}",
+                                    "severity": "info",
+                                    "metadata": {
+                                        "taskId": task_id,
+                                        "count": 1
+                                    }
+                                }
+                            ]
+                        }
+                        resp = http_session.post(
+                            callback_url,
+                            json=payload,
+                            headers={"Content-Type": "application/json"},
+                            timeout=10
+                        )
+                        resp.raise_for_status()
+                    except Exception as cb_err:
+                        logger.error(f"Failed to send progress callback to backend: {cb_err}")
+                await asyncio.to_thread(send_callback)
         except Exception as e:
             if _metrics:
                 _metrics["error_count"] += 1
             logger.error(f"Uploader task error for {task.get('image_url')}: {e}")
         finally:
             uploader_queue.task_done()
+            if 'embedding_bytes' in locals():
+                del embedding_bytes
+            import gc
+            gc.collect()
 
 def start_pipeline(app_metrics: dict, get_predictor_fn, get_config_fn):
     global _metrics, _get_predictor, _get_config
@@ -168,9 +229,9 @@ def start_pipeline(app_metrics: dict, get_predictor_fn, get_config_fn):
     _get_predictor = get_predictor_fn
     _get_config = get_config_fn
     
-    # Spawn pipeline loops
+    # Spawn pipeline loops (1 GPU sequential worker, 8 downloaders, 8 uploaders)
     asyncio.create_task(gpu_loop())
-    for _ in range(3):
+    for _ in range(8):
         asyncio.create_task(downloader_loop())
         asyncio.create_task(uploader_loop())
     logger.info("Modular background task processing pipeline started.")

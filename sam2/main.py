@@ -152,9 +152,9 @@ async def generate_embedding(req: GenerateEmbeddingRequest):
                 emb_buffer = io.BytesIO()
                 np.savez_compressed(
                     emb_buffer,
-                    image_embed=features["image_embed"].cpu().numpy(),
-                    high_res_feat_0=features["high_res_feats"][0].cpu().numpy(),
-                    high_res_feat_1=features["high_res_feats"][1].cpu().numpy(),
+              image_embed=features["image_embed"].float().cpu().numpy(),
+                    high_res_feat_0=features["high_res_feats"][0].float().cpu().numpy(),
+                    high_res_feat_1=features["high_res_feats"][1].float().cpu().numpy(),
                     orig_h=float(orig_h),
                     orig_w=float(orig_w)
                 )

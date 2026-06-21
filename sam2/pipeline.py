@@ -4,6 +4,7 @@ import logging
 import time
 import cv2
 import numpy as np
+import os
 import requests
 
 logger = logging.getLogger("sam2-service.pipeline")
@@ -40,10 +41,11 @@ def send_callback_event(callback_url: str, project_id: str, dataset_id: str, tas
                 }
             ]
         }
+        FASTAPI_ML_API_KEY = os.getenv("FASTAPI_ML_API_KEY", "local-dev-key")
         resp = http_session.post(
             callback_url,
             json=payload,
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", "X-API-Key": FASTAPI_ML_API_KEY},
             timeout=10
         )
         resp.raise_for_status()

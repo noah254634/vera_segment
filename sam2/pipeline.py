@@ -12,7 +12,7 @@ logger = logging.getLogger("sam2-service.pipeline")
 # Queues for 3-stage async/sync execution pipeline
 download_queue = asyncio.Queue()
 gpu_queue = asyncio.Queue(maxsize=4)
-uploader_queue = asyncio.Queue()
+uploader_queue = asyncio.Queue(maxsize=32)
 
 # Injected configurations
 _metrics = None
@@ -143,17 +143,14 @@ async def gpu_loop():
             start_time = time.time()
             if predictor is None or mock_mode:
                 def gen_mock():
-                    emb_buffer = io.BytesIO()
-                    np.savez_compressed(
-                        emb_buffer,
-                        image_embed=np.zeros((1, 256, 64, 64), dtype=np.float32),
-                        high_res_feat_0=np.zeros((1, 32, 256, 256), dtype=np.float32),
-                        high_res_feat_1=np.zeros((1, 64, 128, 128), dtype=np.float32),
-                        orig_h=float(orig_h),
-                        orig_w=float(orig_w)
-                    )
-                    return emb_buffer.getvalue()
-                embedding_bytes = await asyncio.to_thread(gen_mock)
+                    return {
+                        "image_embed": np.zeros((1, 256, 64, 64), dtype=np.float32),
+                        "high_res_feat_0": np.zeros((1, 32, 256, 256), dtype=np.float32),
+                        "high_res_feat_1": np.zeros((1, 64, 128, 128), dtype=np.float32),
+                        "orig_h": float(orig_h),
+                        "orig_w": float(orig_w)
+                    }
+                embedding_data = await asyncio.to_thread(gen_mock)
             else:
                 import torch
                 
@@ -165,29 +162,25 @@ async def gpu_loop():
                         predictor.set_image(img_rgb)
                         features = predictor._features
                         
-                        emb_buffer = io.BytesIO()
-                        np.savez_compressed(
-                            emb_buffer,
-                            image_embed=features["image_embed"].float().cpu().numpy(),
-                            high_res_feat_0=features["high_res_feats"][0].float().cpu().numpy(),
-                            high_res_feat_1=features["high_res_feats"][1].float().cpu().numpy(),
-                            orig_h=float(orig_h),
-                            orig_w=float(orig_w)
-                        )
+                        data = {
+                            "image_embed": features["image_embed"].float().cpu().numpy(),
+                            "high_res_feat_0": features["high_res_feats"][0].float().cpu().numpy(),
+                            "high_res_feat_1": features["high_res_feats"][1].float().cpu().numpy(),
+                            "orig_h": float(orig_h),
+                            "orig_w": float(orig_w)
+                        }
                         # Reset predictor state immediately after extracting tensors to free GPU memory
                         predictor.reset_predictor()
-                        return emb_buffer.getvalue()
+                        return data
                         
-                embedding_bytes = await asyncio.to_thread(run_inference)
-                if "cuda" in device:
-                    torch.cuda.empty_cache()
+                embedding_data = await asyncio.to_thread(run_inference)
                 
             duration = time.time() - start_time
             if _metrics:
                 _metrics["total_embedding_time_sec"] += duration
                 
             await uploader_queue.put({
-                "embedding_bytes": embedding_bytes,
+                "embedding_data": embedding_data,
                 "upload_url": upload_url,
                 "image_url": image_url,
                 "project_id": task.get("project_id"),
@@ -221,11 +214,15 @@ async def uploader_loop():
     while True:
         task = await uploader_queue.get()
         try:
-            embedding_bytes = task["embedding_bytes"]
+            embedding_data = task["embedding_data"]
             upload_url = task["upload_url"]
             image_url = task["image_url"]
             
             def upload():
+                emb_buffer = io.BytesIO()
+                np.savez_compressed(emb_buffer, **embedding_data)
+                embedding_bytes = emb_buffer.getvalue()
+                
                 resp = http_session.put(
                     upload_url,
                     data=embedding_bytes,

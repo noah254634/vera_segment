@@ -6,11 +6,22 @@ import urllib.request
 import requests
 import numpy as np
 import cv2
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, status, Security, Depends
+from fastapi.security.api_key import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, HttpUrl
 from typing import List, Dict, Any, Optional
 from pipeline import start_pipeline, enqueue_task
+
+FASTAPI_ML_API_KEY = os.getenv("FASTAPI_ML_API_KEY", "local-dev-key")
+api_key_header_scheme = APIKeyHeader(name="X-API-Key", auto_error=True)
+
+def get_api_key(api_key: str = Security(api_key_header_scheme)):
+    if api_key != FASTAPI_ML_API_KEY:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="Could not validate API Key"
+        )
+    return api_key
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -124,7 +135,7 @@ class GenerateEmbeddingRequest(BaseModel):
     callback_url: Optional[str] = None
 
 @app.post("/api/v1/generate-embedding", status_code=status.HTTP_202_ACCEPTED)
-async def generate_embedding(req: GenerateEmbeddingRequest):
+async def generate_embedding(req: GenerateEmbeddingRequest, api_key: str = Depends(get_api_key)):
     logger.info(f"Queuing embedding request for task ID: {req.task_id}")
     try:
         await enqueue_task(
@@ -142,7 +153,7 @@ async def generate_embedding(req: GenerateEmbeddingRequest):
         raise HTTPException(status_code=500, detail=f"Failed to queue embedding request: {str(e)}")
 
 @app.get("/api/v1/telemetry")
-def get_telemetry():
+def get_telemetry(api_key: str = Depends(get_api_key)):
     uptime = time.time() - metrics["uptime_start"]
     avg_emb = metrics["total_embedding_time_sec"] / metrics["total_embeddings_generated"] if metrics["total_embeddings_generated"] > 0 else 0.0
     
@@ -167,7 +178,7 @@ def get_telemetry():
     }
 
 @app.get("/api/v1/settings")
-def get_settings():
+def get_settings(api_key: str = Depends(get_api_key)):
     return {
         "mock_mode": FASTAPI_ML_MOCK,
         "device": DEVICE,
@@ -176,7 +187,7 @@ def get_settings():
     }
 
 @app.post("/api/v1/settings")
-def update_settings(update: SettingsUpdate):
+def update_settings(update: SettingsUpdate, api_key: str = Depends(get_api_key)):
     global FASTAPI_ML_MOCK, DEVICE
     needs_reload = False
     

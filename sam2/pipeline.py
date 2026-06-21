@@ -12,7 +12,7 @@ logger = logging.getLogger("sam2-service.pipeline")
 # Queues for 3-stage async/sync execution pipeline
 download_queue = asyncio.Queue()
 gpu_queue = asyncio.Queue(maxsize=4)
-uploader_queue = asyncio.Queue(maxsize=32)
+uploader_queue = asyncio.Queue(maxsize=64)
 
 # Injected configurations
 _metrics = None
@@ -150,7 +150,7 @@ async def gpu_loop():
                         "orig_h": float(orig_h),
                         "orig_w": float(orig_w)
                     }
-                embedding_data = await asyncio.to_thread(gen_mock)
+                embedding_data = gen_mock()
             else:
                 import torch
                 
@@ -173,7 +173,7 @@ async def gpu_loop():
                         predictor.reset_predictor()
                         return data
                         
-                embedding_data = await asyncio.to_thread(run_inference)
+                embedding_data = run_inference()
                 
             duration = time.time() - start_time
             if _metrics:
@@ -285,9 +285,10 @@ def start_pipeline(app_metrics: dict, get_predictor_fn, get_config_fn):
     _get_predictor = get_predictor_fn
     _get_config = get_config_fn
     
-    # Spawn pipeline loops (1 GPU sequential worker, 8 downloaders, 8 uploaders)
+    # Spawn pipeline loops (1 GPU sequential worker, 8 downloaders, 32 uploaders)
     asyncio.create_task(gpu_loop())
     for _ in range(8):
         asyncio.create_task(downloader_loop())
+    for _ in range(32):
         asyncio.create_task(uploader_loop())
     logger.info("Modular background task processing pipeline started.")
